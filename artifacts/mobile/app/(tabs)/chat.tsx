@@ -2,8 +2,10 @@ import { Feather } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import React, { useRef, useState } from "react";
 import {
+  ActivityIndicator,
   FlatList,
   Platform,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -14,72 +16,201 @@ import { KeyboardAvoidingView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import ChatBubble, { Message } from "@/components/ChatBubble";
 import { useColors } from "@/hooks/useColors";
+import { useAppContext } from "@/context/AppContext";
 
-const AI_RESPONSES = [
-  "I'm analyzing your Lifestyle Energy metrics. Your optimal work windows appear to be 9-11 AM and 3-5 PM based on recent data.",
-  "The PAI Core agent has processed your request. Research synthesis is underway — expect results within 2 minutes.",
-  "Based on your current system load, I recommend deferring the automation pipeline by 30 minutes to optimize CPU usage.",
-  "Memory consolidation is complete. I've indexed 47 new entries across 5 knowledge categories.",
-  "Your project 'Lifestyle Energy Dashboard' is 72% complete. Next milestone: API integration layer. Estimated completion: 3 days.",
-  "I've identified 3 research papers highly relevant to your current project. Shall I compile a synthesis report?",
-  "Automation pipeline 'Daily Research Digest' executed successfully. Summary ready in your Reports section.",
-  "System health is optimal. CPU: 34%, RAM: 52%, Storage: 67%. All agents operating within normal parameters.",
+type AIModel = "gpt" | "deepseek";
+
+const MODEL_OPTIONS: { id: AIModel; label: string; sublabel: string }[] = [
+  { id: "gpt", label: "ChatGPT", sublabel: "GPT-4o" },
+  { id: "deepseek", label: "DeepSeek", sublabel: "Free · V3" },
 ];
-
-let responseIdx = 0;
-
-function getNextResponse(): string {
-  const r = AI_RESPONSES[responseIdx % AI_RESPONSES.length];
-  responseIdx++;
-  return r;
-}
 
 const INITIAL_MESSAGES: Message[] = [
   {
     id: "0",
     role: "assistant",
-    content: "Hello! I'm PAI — your Personal AI. I have full access to your agents, projects, and system data. How can I assist you today?",
-    timestamp: "now",
+    content:
+      "Hello! I'm PAI — your Personal AI. I have full access to your agents, projects, and system data. How can I assist you today?",
+    timestamp: new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
   },
 ];
+
+function getApiBase(): string {
+  const domain = process.env.EXPO_PUBLIC_DOMAIN;
+  if (domain) return `https://${domain}/api`;
+  return "/api";
+}
 
 export default function ChatScreen() {
   const colors = useColors();
   const insets = useSafeAreaInsets();
   const isWeb = Platform.OS === "web";
+  const { systemStatus, agents, projects } = useAppContext();
+
   const [messages, setMessages] = useState<Message[]>(INITIAL_MESSAGES);
   const [input, setInput] = useState("");
-  const [isTyping, setIsTyping] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<AIModel>("gpt");
+  const [streamingId, setStreamingId] = useState<string | null>(null);
   const flatListRef = useRef<FlatList>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const paddingTop = isWeb ? insets.top + 67 : insets.top + 16;
 
-  const sendMessage = () => {
-    if (!input.trim() || isTyping) return;
+  function buildSystemContext(): string {
+    const runningAgents = agents
+      .filter((a) => a.status === "running")
+      .map((a) => a.name)
+      .join(", ");
+    const activeProjects = projects
+      .filter((p) => p.status === "active")
+      .map((p) => p.name)
+      .join(", ");
+
+    return [
+      `CPU: ${systemStatus.cpu}%`,
+      `RAM: ${systemStatus.ram}%`,
+      `Battery: ${systemStatus.battery}%`,
+      `Storage: ${systemStatus.storage.used}/${systemStatus.storage.total}GB`,
+      `Network: ↑${systemStatus.network.upload}MB/s ↓${systemStatus.network.download}MB/s`,
+      `AI Status: ${systemStatus.aiStatus}`,
+      `Running Agents: ${runningAgents || "none"}`,
+      `Active Projects: ${activeProjects || "none"}`,
+      `Queued Workflows: ${systemStatus.workflowQueue}`,
+    ].join("\n");
+  }
+
+  function buildApiMessages() {
+    return [...messages]
+      .reverse()
+      .filter((m) => m.id !== "0")
+      .map((m) => ({ role: m.role, content: m.content }));
+  }
+
+  const sendMessage = async () => {
+    if (!input.trim() || isStreaming) return;
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
     const userMsg: Message = {
       id: Date.now().toString(),
       role: "user",
       content: input.trim(),
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
     };
 
+    const currentInput = input.trim();
     setMessages((prev) => [userMsg, ...prev]);
     setInput("");
-    setIsTyping(true);
+    setIsStreaming(true);
 
-    setTimeout(() => {
-      const aiMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        role: "assistant",
-        content: getNextResponse(),
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      };
-      setMessages((prev) => [aiMsg, ...prev]);
-      setIsTyping(false);
+    const aiId = (Date.now() + 1).toString();
+    setStreamingId(aiId);
+
+    const streamingMsg: Message = {
+      id: aiId,
+      role: "assistant",
+      content: "",
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    };
+    setMessages((prev) => [streamingMsg, ...prev]);
+
+    const abort = new AbortController();
+    abortRef.current = abort;
+
+    try {
+      const historyMessages = buildApiMessages();
+      const body = JSON.stringify({
+        messages: [
+          ...historyMessages,
+          { role: "user", content: currentInput },
+        ],
+        model: selectedModel,
+        systemContext: buildSystemContext(),
+      });
+
+      const response = await fetch(`${getApiBase()}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+        signal: abort.signal,
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Server error: ${response.status}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let accumulated = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split("\n");
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          const data = line.slice(6).trim();
+          if (!data) continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.done) break;
+            if (parsed.error) throw new Error(parsed.error);
+            if (parsed.content) {
+              accumulated += parsed.content;
+              const snapshot = accumulated;
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === aiId ? { ...m, content: snapshot } : m
+                )
+              );
+            }
+          } catch {
+            // skip malformed SSE lines
+          }
+        }
+      }
+
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    }, 1200 + Math.random() * 800);
+    } catch (err: unknown) {
+      if ((err as Error)?.name === "AbortError") return;
+      const errMsg =
+        err instanceof Error ? err.message : "Connection failed. Try again.";
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === aiId
+            ? { ...m, content: `⚠️ ${errMsg}` }
+            : m
+        )
+      );
+    } finally {
+      setIsStreaming(false);
+      setStreamingId(null);
+      abortRef.current = null;
+    }
+  };
+
+  const stopStreaming = () => {
+    abortRef.current?.abort();
+    setIsStreaming(false);
+    setStreamingId(null);
+  };
+
+  const clearChat = () => {
+    setMessages(INITIAL_MESSAGES);
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
   };
 
   return (
@@ -100,63 +231,139 @@ export default function ChatScreen() {
         ]}
       >
         <View style={styles.headerInfo}>
-          <View style={[styles.aiAvatar, { backgroundColor: colors.primary + "22", borderColor: colors.primary + "55" }]}>
-            <Text style={[styles.aiAvatarText, { color: colors.primary }]}>AI</Text>
+          <View
+            style={[
+              styles.aiAvatar,
+              {
+                backgroundColor: colors.primary + "22",
+                borderColor: colors.primary + "55",
+              },
+            ]}
+          >
+            <Text style={[styles.aiAvatarText, { color: colors.primary }]}>
+              AI
+            </Text>
           </View>
           <View>
-            <Text style={[styles.headerTitle, { color: colors.foreground }]}>PAI Assistant</Text>
+            <Text style={[styles.headerTitle, { color: colors.foreground }]}>
+              PAI Assistant
+            </Text>
             <View style={styles.statusRow}>
-              <View style={[styles.onlineDot, { backgroundColor: colors.success }]} />
-              <Text style={[styles.statusText, { color: colors.success }]}>Online · GPT-4o</Text>
+              <View
+                style={[
+                  styles.onlineDot,
+                  {
+                    backgroundColor: isStreaming
+                      ? colors.warning
+                      : colors.success,
+                  },
+                ]}
+              />
+              <Text
+                style={[
+                  styles.statusText,
+                  {
+                    color: isStreaming ? colors.warning : colors.success,
+                  },
+                ]}
+              >
+                {isStreaming
+                  ? "Generating…"
+                  : `Online · ${selectedModel === "gpt" ? "GPT-4o" : "DeepSeek V3"}`}
+              </Text>
             </View>
           </View>
         </View>
         <TouchableOpacity
           style={[styles.clearBtn, { backgroundColor: colors.muted }]}
-          onPress={() => {
-            setMessages(INITIAL_MESSAGES);
-            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-          }}
+          onPress={clearChat}
           activeOpacity={0.7}
         >
           <Feather name="trash-2" size={16} color={colors.mutedForeground} />
         </TouchableOpacity>
       </View>
 
+      {/* Model selector */}
+      <ScrollView
+        horizontal
+        showsHorizontalScrollIndicator={false}
+        contentContainerStyle={[
+          styles.modelRow,
+          { borderBottomColor: colors.border },
+        ]}
+      >
+        {MODEL_OPTIONS.map((opt) => {
+          const active = selectedModel === opt.id;
+          return (
+            <TouchableOpacity
+              key={opt.id}
+              style={[
+                styles.modelChip,
+                {
+                  backgroundColor: active
+                    ? colors.primary + "22"
+                    : colors.muted,
+                  borderColor: active ? colors.primary : colors.border,
+                },
+              ]}
+              onPress={() => setSelectedModel(opt.id)}
+              activeOpacity={0.7}
+            >
+              <Text
+                style={[
+                  styles.modelLabel,
+                  { color: active ? colors.primary : colors.mutedForeground },
+                ]}
+              >
+                {opt.label}
+              </Text>
+              <Text
+                style={[styles.modelSublabel, { color: colors.mutedForeground }]}
+              >
+                {opt.sublabel}
+              </Text>
+            </TouchableOpacity>
+          );
+        })}
+      </ScrollView>
+
       {/* Messages */}
       <FlatList
         ref={flatListRef}
         data={messages}
         keyExtractor={(m) => m.id}
-        renderItem={({ item }) => <ChatBubble message={item} />}
+        renderItem={({ item }) => (
+          <ChatBubble
+            message={item}
+            isStreaming={isStreaming && item.id === streamingId}
+          />
+        )}
         inverted
         contentContainerStyle={{ paddingVertical: 16, gap: 4 }}
         keyboardDismissMode="interactive"
         keyboardShouldPersistTaps="handled"
         showsVerticalScrollIndicator={false}
-        ListHeaderComponent={
-          isTyping ? (
-            <View style={[styles.typingRow, { paddingHorizontal: 16 }]}>
-              <View style={[styles.typingBubble, { backgroundColor: colors.card, borderColor: colors.border }]}>
-                <Text style={[styles.typingDots, { color: colors.mutedForeground }]}>●●●</Text>
-              </View>
-            </View>
-          ) : null
-        }
       />
 
-      {/* Input */}
+      {/* Input bar */}
       <View
         style={[
           styles.inputBar,
           {
             backgroundColor: colors.background,
             borderTopColor: colors.border,
-            paddingBottom: isWeb ? 34 + insets.bottom : insets.bottom + 84 + 8,
+            paddingBottom: isWeb
+              ? 34 + insets.bottom
+              : insets.bottom + 84 + 8,
           },
         ]}
       >
-        <View style={[styles.inputWrapper, { backgroundColor: colors.muted, borderColor: colors.border }]}>
+        <View
+          style={[
+            styles.inputWrapper,
+            { backgroundColor: colors.muted, borderColor: colors.border },
+          ]}
+        >
           <TextInput
             style={[styles.input, { color: colors.foreground }]}
             placeholder="Message PAI..."
@@ -167,17 +374,43 @@ export default function ChatScreen() {
             maxLength={2000}
             onSubmitEditing={sendMessage}
           />
-          <TouchableOpacity
-            style={[
-              styles.sendBtn,
-              { backgroundColor: input.trim() ? colors.primary : colors.accent },
-            ]}
-            onPress={sendMessage}
-            activeOpacity={0.7}
-            disabled={!input.trim() || isTyping}
-          >
-            <Feather name="send" size={16} color={input.trim() ? colors.primaryForeground : colors.mutedForeground} />
-          </TouchableOpacity>
+          {isStreaming ? (
+            <TouchableOpacity
+              style={[styles.sendBtn, { backgroundColor: colors.destructive }]}
+              onPress={stopStreaming}
+              activeOpacity={0.7}
+            >
+              <Feather name="square" size={14} color="#fff" />
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity
+              style={[
+                styles.sendBtn,
+                {
+                  backgroundColor: input.trim()
+                    ? colors.primary
+                    : colors.accent,
+                },
+              ]}
+              onPress={sendMessage}
+              activeOpacity={0.7}
+              disabled={!input.trim()}
+            >
+              {isStreaming ? (
+                <ActivityIndicator size="small" color={colors.primaryForeground} />
+              ) : (
+                <Feather
+                  name="send"
+                  size={16}
+                  color={
+                    input.trim()
+                      ? colors.primaryForeground
+                      : colors.mutedForeground
+                  }
+                />
+              )}
+            </TouchableOpacity>
+          )}
         </View>
       </View>
     </KeyboardAvoidingView>
@@ -237,20 +470,29 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
-  typingRow: {
-    marginBottom: 8,
-  },
-  typingBubble: {
-    alignSelf: "flex-start",
-    marginLeft: 40,
+  modelRow: {
+    flexDirection: "row",
+    gap: 8,
     paddingHorizontal: 16,
     paddingVertical: 10,
-    borderRadius: 18,
+    borderBottomWidth: 1,
+  },
+  modelChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    borderRadius: 20,
     borderWidth: 1,
   },
-  typingDots: {
-    fontSize: 10,
-    letterSpacing: 4,
+  modelLabel: {
+    fontSize: 13,
+    fontFamily: "Inter_600SemiBold",
+  },
+  modelSublabel: {
+    fontSize: 11,
+    fontFamily: "Inter_400Regular",
   },
   inputBar: {
     borderTopWidth: 1,
