@@ -47,3 +47,13 @@ Phase 1 — Foundation
 ## License
 
 MIT
+
+---
+
+## Lifestyle Energy
+
+Building smarter futures by turning voltage into value.
+
+Observe → Understand → Refine → Activate Intelligent Memory
+
+The repositories in this organization work together to create a modular, autonomous AI operating system for intelligent automation, knowledge management, and production-ready AI applications.
